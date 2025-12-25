@@ -40,7 +40,7 @@ static bool isModern = false;
 #include <minecraft/GenericMinecraft.h>
 #include <signal.h>
 #include <sys/stat.h>
-#include <sys/timeb.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -48,6 +48,25 @@ static bool isModern = false;
 
 #include "JNIBinding.h"
 #include "OpenSLESPatch.h"
+#include "config.h"
+
+// Replacement for deprecated ftime() using gettimeofday()
+struct timeb {
+  time_t time;
+  unsigned short millitm;
+  short timezone;
+  short dstflag;
+};
+
+static int ftime_replacement(struct timeb *tb) {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  tb->time = tv.tv_sec;
+  tb->millitm = tv.tv_usec / 1000;
+  tb->timezone = 0;
+  tb->dstflag = 0;
+  return 0;
+}
 #include "native_activity.h"
 
 // Log verbosity level
@@ -395,6 +414,10 @@ int main(int argc, char *argv[])
   CrashHandler::registerCrashHandler();
   MinecraftUtils::workaroundLocaleBug();
 
+  // Load configuration file
+  LauncherConfig config;
+  bool configLoaded = config.load();
+
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGuiIO &io = ImGui::GetIO();
@@ -412,6 +435,8 @@ int main(int argc, char *argv[])
   // Basic options
   argparser::arg<bool> printVersion(p, "--version", "-v",
                                     "Prints version info");
+  argparser::arg<bool> saveConfig(p, "--save-config", "-sc",
+                                  "Save current settings to config file");
   
   // Directory options
   argparser::arg<std::string> gameDir(p, "--game-dir", "-dg",
@@ -421,10 +446,13 @@ int main(int argc, char *argv[])
   argparser::arg<std::string> cacheDir(p, "--cache-dir", "-dc",
                                        "Directory to use for cache");
   
-  // Window options
-  argparser::arg<int> windowWidth(p, "--width", "-ww", "Window width", 720);
-  argparser::arg<int> windowHeight(p, "--height", "-wh", "Window height", 480);
-  argparser::arg<float> pixelScale(p, "--scale", "-s", "Pixel Scale", 2.f);
+  // Window options - use config defaults
+  argparser::arg<int> windowWidth(p, "--width", "-ww", "Window width", 
+                                  config.getWindowWidth());
+  argparser::arg<int> windowHeight(p, "--height", "-wh", "Window height", 
+                                   config.getWindowHeight());
+  argparser::arg<float> pixelScale(p, "--scale", "-s", "Pixel Scale", 
+                                   config.getPixelScale());
   
   // Audio options
   argparser::arg<bool> disableFmod(p, "--disable-fmod", "-df",
@@ -447,25 +475,50 @@ int main(int argc, char *argv[])
   
   if (!p.parse(argc, const_cast<const char **>(argv))) return 0;
   
+  // Determine effective settings (CLI overrides config)
+  bool effectiveDisableFmod = disableFmod || config.isFmodDisabled();
+  bool effectiveDisableCache = disableCache || config.isAssetCacheDisabled();
+  
   // Handle verbosity settings
   if (quiet)
   {
     g_logVerbosity = 0;
     Log::setMinLevel(LogLevel::LOG_ERROR);
   }
-  if (verbose)
+  else if (verbose)
   {
     g_logVerbosity = 2;
     Log::setMinLevel(LogLevel::LOG_TRACE);
   }
-  if (disableCache) g_enableAssetCache = false;
+  else if (config.getLogLevel() == 0)
+  {
+    g_logVerbosity = 0;
+    Log::setMinLevel(LogLevel::LOG_ERROR);
+  }
+  else if (config.getLogLevel() == 2)
+  {
+    g_logVerbosity = 2;
+    Log::setMinLevel(LogLevel::LOG_TRACE);
+  }
+  
+  if (effectiveDisableCache) g_enableAssetCache = false;
   
   if (printVersion)
   {
     printVersionInfo();
     return 0;
   }
-  if (!gameDir.get().empty()) PathHelper::setGameDir(gameDir);
+  
+  // Use last game dir from config if not specified
+  if (gameDir.get().empty() && !config.getLastGameDir().empty())
+  {
+    PathHelper::setGameDir(config.getLastGameDir());
+  }
+  else if (!gameDir.get().empty())
+  {
+    PathHelper::setGameDir(gameDir);
+  }
+  
   if (!dataDir.get().empty()) PathHelper::setDataDir(dataDir);
   if (!cacheDir.get().empty()) PathHelper::setCacheDir(cacheDir);
   if (mallocZero) MinecraftUtils::setMallocZero();
@@ -474,9 +527,38 @@ int main(int argc, char *argv[])
   {
     std::cerr << "ERROR: NO GAME DIRECTORY FOUND.\n";
     std::cerr << "PLEASE PROVIDE A GAME DIRECTORY WITH --game-dir\n";
+    if (!config.getLastGameDir().empty())
+    {
+      std::cerr << "Last used: " << config.getLastGameDir() << "\n";
+    }
     std::cerr << "Bye.\n";
     abort();
   }
+  
+  // Save config if requested
+  if (saveConfig)
+  {
+    config.setWindowWidth(windowWidth);
+    config.setWindowHeight(windowHeight);
+    config.setPixelScale(pixelScale);
+    config.setDisableFmod(effectiveDisableFmod);
+    config.setDisableAssetCache(effectiveDisableCache);
+    config.setLogLevel(g_logVerbosity);
+    config.setLastGameDir(PathHelper::getGameDir());
+    if (config.save())
+    {
+      std::cout << "Configuration saved to: " << config.getConfigPath() << "\n";
+    }
+    else
+    {
+      std::cerr << "Failed to save configuration\n";
+    }
+    return 0;
+  }
+  
+  // Update last game dir in config
+  config.setLastGameDir(PathHelper::getGameDir());
+  config.save();
 
   // Dry-run mode: validate setup and exit
   if (dryRun)
@@ -487,6 +569,7 @@ int main(int argc, char *argv[])
     std::cout << "Game directory: " << PathHelper::getGameDir() << "\n";
     std::cout << "Data directory: " << PathHelper::getPrimaryDataDirectory() << "\n";
     std::cout << "Cache directory: " << PathHelper::getCacheDirectory() << "\n";
+    std::cout << "Config file: " << config.getConfigPath() << (configLoaded ? " (loaded)" : " (not found)") << "\n";
     
     // Check for required files
     std::string libPath = PathHelper::getGameDir() + "lib/x86/libminecraftpe.so";
@@ -536,7 +619,7 @@ int main(int argc, char *argv[])
 
   if (g_logVerbosity >= 2)
     Log::trace("Launcher", "Loading hybris libraries");
-  if (!disableFmod)
+  if (!effectiveDisableFmod)
   {
     MinecraftUtils::loadFMod();
 #ifdef __arm__
@@ -847,7 +930,7 @@ int main(int argc, char *argv[])
         }
       });
   // For 0.11 or lower
-  hybris_hook("ftime", (void *)&ftime);
+  hybris_hook("ftime", (void *)&ftime_replacement);
   OpenSLESPatch::install();
 
 #ifdef __i386__

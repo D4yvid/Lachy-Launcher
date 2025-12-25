@@ -63,11 +63,40 @@ cmake --build build -j$(nproc)
 | `--dry-run` | `-n` | Validate setup and exit without launching |
 | `--verbose` | `-V` | Enable verbose logging |
 | `--quiet` | `-q` | Suppress most log output |
+| `--save-config` | `-sc` | Save current settings to config file |
+
+## Configuration File
+
+Settings are stored in `~/.config/mcpelauncher/config.properties`. The launcher automatically:
+- Loads settings on startup
+- Remembers the last used game directory
+- Saves the game directory after each launch
+
+### Config File Format
+```properties
+# Lachy-Launcher Configuration
+window.width=720
+window.height=480
+window.scale=2.0
+audio.disable_fmod=false
+performance.disable_cache=false
+log.level=1
+game.last_dir=/path/to/game/
+```
+
+### Saving Settings
+Use `--save-config` to save current CLI options to the config file:
+```bash
+./mcpelauncher-client -dg /path/to/game -ww 1280 -wh 720 --disable-fmod --save-config
+```
 
 ## Examples
 
 ```bash
-# Basic launch
+# Basic launch (uses last game dir from config)
+./mcpelauncher-client
+
+# Launch with specific game directory
 ./mcpelauncher-client -dg ~/.local/share/mcpelauncher/versions/0.15.10.0/
 
 # Launch with custom window size
