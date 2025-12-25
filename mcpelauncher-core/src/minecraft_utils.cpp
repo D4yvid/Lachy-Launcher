@@ -58,10 +58,21 @@ void* MinecraftUtils::loadFMod()
   void* fmodLib = HybrisUtils::loadLibraryOS(
       PathHelper::findDataFile("libs/native/libfmod.dylib"), fmod_symbols);
 #else
-  void* fmodLib = HybrisUtils::loadLibraryOS(
-      PathHelper::findDataFile("libs/native/libfmod.so.9.16"), fmod_symbols);
+  std::string fmodPath;
+  try {
+    fmodPath = PathHelper::findDataFile("libs/native/libfmod.so.9.16");
+  } catch (std::runtime_error& e) {
+    Log::warn("Launcher", "FMod library not found, using stubs");
+    stubFMod();
+    return nullptr;
+  }
+  void* fmodLib = HybrisUtils::loadLibraryOS(fmodPath, fmod_symbols);
 #endif
-  if (fmodLib == nullptr) throw std::runtime_error("Failed to load fmod");
+  if (fmodLib == nullptr) {
+    Log::warn("Launcher", "Failed to load FMod library, using stubs (no sound)");
+    stubFMod();
+    return nullptr;
+  }
   return fmodLib;
 }
 

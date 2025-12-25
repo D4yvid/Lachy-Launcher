@@ -3,6 +3,10 @@
 // Needed for loading pictures
 jint android::os::Build::VERSION::SDK_INT = 28;
 
+// Static field stubs for android.os.Build
+static jnivm::java::lang::String* BUILD_MANUFACTURER = nullptr;
+static jnivm::java::lang::String* BUILD_MODEL = nullptr;
+
 jnivm::android::view::View* android::view::Window::getDecorView(JNIEnv* env)
 {
   auto view = new jnivm::android::view::View();
@@ -129,4 +133,22 @@ extern "C" jnivm::java::lang::String* jnivm_java_io_File_getPath(
     JNIEnv* env, jnivm::java::io::File* obj, jvalue* values)
 {
   return obj->getPath(env);
+}
+
+// Build class static fields
+extern "C" jnivm::java::lang::String* get_jnivm_android_os_Build_MANUFACTURER()
+{
+  return BUILD_MANUFACTURER;
+}
+extern "C" void set_jnivm_android_os_Build_MANUFACTURER(jnivm::java::lang::String* value)
+{
+  BUILD_MANUFACTURER = value;
+}
+extern "C" jnivm::java::lang::String* get_jnivm_android_os_Build_MODEL()
+{
+  return BUILD_MODEL;
+}
+extern "C" void set_jnivm_android_os_Build_MODEL(jnivm::java::lang::String* value)
+{
+  BUILD_MODEL = value;
 }

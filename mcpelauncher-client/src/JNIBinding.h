@@ -195,6 +195,8 @@ class com::mojang::minecraftpe::MainActivity : public jnivm::java::lang::Object
   void initiateUserInput(JNIEnv *, jint);
   jint getUserInputStatus(JNIEnv *);
   jnivm::Array<jnivm::java::lang::String *> *getUserInputString(JNIEnv *);
+  jnivm::java::lang::String *getDateString(JNIEnv *, jint);
+  jnivm::java::lang::String *getDeviceId(JNIEnv *);
   jint checkLicense(JNIEnv *);
   jboolean hasBuyButtonWhenInvalidLicense(JNIEnv *);
   void buyGame(JNIEnv *);

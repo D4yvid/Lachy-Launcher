@@ -1,6 +1,7 @@
 #include "../JNIBinding.h"
 #include "../utf8_util.h"
 #include "minecraft/Keyboard.h"
+#include <ctime>
 
 jnivm::com::mojang::minecraftpe::MainActivity::MainActivity(void* handle)
 {
@@ -219,6 +220,23 @@ jnivm::Array<jnivm::java::lang::String*>*
 com::mojang::minecraftpe::MainActivity::getUserInputString(JNIEnv* env)
 {
   return 0;
+}
+
+jnivm::java::lang::String*
+com::mojang::minecraftpe::MainActivity::getDateString(JNIEnv* env, jint arg0)
+{
+  // Return current date in expected format
+  time_t now = time(nullptr);
+  struct tm* tm_info = localtime(&now);
+  char buffer[32];
+  strftime(buffer, 32, "%Y-%m-%d", tm_info);
+  return (jnivm::java::lang::String*)env->NewStringUTF(buffer);
+}
+
+jnivm::java::lang::String*
+com::mojang::minecraftpe::MainActivity::getDeviceId(JNIEnv* env)
+{
+  return (jnivm::java::lang::String*)env->NewStringUTF("linux-device");
 }
 
 jint com::mojang::minecraftpe::MainActivity::checkLicense(JNIEnv* env)
@@ -638,7 +656,7 @@ jint com::mojang::minecraftpe::MainActivity::getAndroidVersion(JNIEnv* env)
 jnivm::java::lang::String* com::mojang::minecraftpe::MainActivity::getLocale(
     JNIEnv* env)
 {
-  return (jnivm::java::lang::String*)env->NewStringUTF("en");
+  return (jnivm::java::lang::String*)env->NewStringUTF("en_US");
 }
 
 jboolean com::mojang::minecraftpe::MainActivity::isFirstSnooperStart(
@@ -1228,4 +1246,18 @@ extern "C" void jnivm_com_mojang_minecraftpe_MainActivity_webRequest(
                          (jnivm::java::lang::String*&)values[3],
                          (jnivm::java::lang::String*&)values[4],
                          (jnivm::java::lang::String*&)values[5]);
+}
+extern "C" jnivm::java::lang::String*
+jnivm_com_mojang_minecraftpe_MainActivity_getDateString(
+    JNIEnv* env, jnivm::com::mojang::minecraftpe::MainActivity* obj,
+    jvalue* values)
+{
+  return obj->getDateString(env, (jint&)values[0]);
+}
+extern "C" jnivm::java::lang::String*
+jnivm_com_mojang_minecraftpe_MainActivity_getDeviceId(
+    JNIEnv* env, jnivm::com::mojang::minecraftpe::MainActivity* obj,
+    jvalue* values)
+{
+  return obj->getDeviceId(env);
 }

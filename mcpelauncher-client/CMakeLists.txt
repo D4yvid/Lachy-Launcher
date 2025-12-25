@@ -9,6 +9,11 @@ add_executable(mcpelauncher-client src/main.cpp src/OpenSLESPatch.cpp src/OpenSL
 target_link_libraries(mcpelauncher-client jnivm logger mcpelauncher-core gamewindow filepicker msa-daemon-client cll-telemetry argparser)
 target_include_directories(mcpelauncher-client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${CMAKE_CURRENT_BINARY_DIR}/build_info/)
 
+# Export all symbols for JNIVM resolution
+if (NOT APPLE)
+    target_link_options(mcpelauncher-client PRIVATE -rdynamic)
+endif()
+
 if (APPLE)
     set_target_properties(mcpelauncher-client PROPERTIES MACOSX_RPATH TRUE INSTALL_RPATH @executable_path/../Frameworks)
 endif()

@@ -25,6 +25,9 @@ enum class LogLevel
 
 class Log
 {
+ private:
+  static LogLevel minLevel;
+  
  public:
   static inline const char* getLogLevelString(LogLevel lvl)
   {
@@ -35,6 +38,9 @@ class Log
     if (lvl == LogLevel::LOG_ERROR) return "Error";
     return "?";
   }
+  
+  static void setMinLevel(LogLevel level) { minLevel = level; }
+  static LogLevel getMinLevel() { return minLevel; }
 
   static void vlog(LogLevel level, const char* tag, const char* text,
                    va_list args);

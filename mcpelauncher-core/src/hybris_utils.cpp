@@ -24,7 +24,7 @@ void* HybrisUtils::loadLibraryOS(std::string path, const char** symbols)
   void* handle = dlopen(path.c_str(), RTLD_LAZY);
   if (handle == nullptr)
   {
-    Log::error(TAG, "Failed to load OS library %s", path.c_str());
+    Log::error(TAG, "Failed to load OS library %s: %s", path.c_str(), dlerror());
     return nullptr;
   }
   Log::trace(TAG, "Loaded OS library %s", path.c_str());

@@ -3,6 +3,11 @@
 SET(CMAKE_C_FLAGS             "-m32" CACHE STRING "C compiler flags"   FORCE)
 SET(CMAKE_CXX_FLAGS           "-m32" CACHE STRING "C++ compiler flags" FORCE)
 
+# Optimization flags for Release builds
+SET(CMAKE_C_FLAGS_RELEASE     "-O3 -DNDEBUG -march=native -flto" CACHE STRING "C release flags" FORCE)
+SET(CMAKE_CXX_FLAGS_RELEASE   "-O3 -DNDEBUG -march=native -flto" CACHE STRING "C++ release flags" FORCE)
+SET(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto" CACHE STRING "Linker release flags" FORCE)
+
 SET(LIB32 /usr/lib) # Fedora
 
 IF(EXISTS /usr/lib32)

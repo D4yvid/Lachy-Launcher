@@ -17,6 +17,7 @@
 
 #include <functional>
 #include <iostream>
+#include <unordered_map>
 
 #include "mcpelauncher/app_platform.h"
 #include "mcpelauncher/core_mod_loader.h"
@@ -33,10 +34,12 @@ static bool isModern = false;
 #endif
 #include <build_info.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <hybris/hook.h>
 #include <jnivm.h>
 #include <minecraft/GenericMinecraft.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/timeb.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -46,6 +49,15 @@ static bool isModern = false;
 #include "JNIBinding.h"
 #include "OpenSLESPatch.h"
 #include "native_activity.h"
+
+// Log verbosity level
+static int g_logVerbosity = 1; // 0=quiet, 1=normal, 2=verbose
+
+// Asset cache for improved performance
+static std::unordered_map<std::string, std::string> g_assetCache;
+static bool g_enableAssetCache = true;
+static size_t g_assetCacheHits = 0;
+static size_t g_assetCacheMisses = 0;
 
 #define EGL_NONE 0x3038
 #define EGL_TRUE 1
@@ -117,6 +129,122 @@ void patchFixSettingsPath(PatchUtils::VtableReplaceHelper vtr)
 {
   vtr.replace("_ZN11AppPlatform15getSettingsPathEv", &getSetttingsPath);
   vtr.replace("_ZN19AppPlatform_android15getSettingsPathEv", &getSetttingsPath);
+}
+
+/**
+ * Read asset file for legacy versions (pre-0.16)
+ * The game passes a relative path, we prepend the assets directory
+ * Implements caching for frequently accessed files
+ */
+mcpe::string readAssetFileLegacy(void *self, mcpe::string const &path)
+{
+  // Cache the assets directory to avoid repeated lookups
+  static std::string cachedAssetsDir;
+  if (cachedAssetsDir.empty())
+  {
+    cachedAssetsDir = PathHelper::getGameDir() + "assets/";
+  }
+  
+  std::string pathStr = path.std();
+  
+  // Check cache first (for files under 1MB)
+  if (g_enableAssetCache)
+  {
+    auto it = g_assetCache.find(pathStr);
+    if (it != g_assetCache.end())
+    {
+      g_assetCacheHits++;
+      return mcpe::string(it->second.c_str(), it->second.size());
+    }
+    g_assetCacheMisses++;
+  }
+  
+  std::string fullPath = cachedAssetsDir + pathStr;
+  int fd = open(fullPath.c_str(), O_RDONLY);
+  if (fd < 0)
+  {
+    if (g_logVerbosity >= 2)
+      Log::error("readAssetFileLegacy", "not found: %s", fullPath.c_str());
+    return mcpe::string();
+  }
+  struct stat sr;
+  if (fstat(fd, &sr) < 0 || (sr.st_mode & S_IFDIR))
+  {
+    close(fd);
+    return mcpe::string();
+  }
+  off_t size = sr.st_size;
+  
+  std::string buffer;
+  buffer.resize((size_t)size);
+  
+  ssize_t bytesRead = read(fd, &buffer[0], size);
+  if (bytesRead < 0)
+  {
+    Log::error("readAssetFileLegacy", "read error");
+    close(fd);
+    return mcpe::string();
+  }
+  
+  while (bytesRead < size)
+  {
+    ssize_t res = read(fd, &buffer[0] + bytesRead, size - bytesRead);
+    if (res <= 0)
+    {
+      Log::error("readAssetFileLegacy", "read error");
+      close(fd);
+      return mcpe::string();
+    }
+    bytesRead += res;
+  }
+  close(fd);
+  
+  // Cache small files (under 1MB) for reuse
+  if (g_enableAssetCache && size < 1024 * 1024)
+  {
+    g_assetCache[pathStr] = buffer;
+  }
+  
+  return mcpe::string(buffer.c_str(), buffer.size());
+}
+
+mcpe::string getImagePathLegacy(void *self, mcpe::string const &s, int loc)
+{
+  // Cache the assets directory
+  static std::string cachedAssetsDir;
+  if (cachedAssetsDir.empty())
+  {
+    cachedAssetsDir = PathHelper::getGameDir() + "assets/";
+  }
+  
+  if (loc == 0)
+    return cachedAssetsDir + "images/" + s.std();
+  else
+    return cachedAssetsDir + s.std();
+}
+
+void patchReadAssetFileLegacy(PatchUtils::VtableReplaceHelper vtr, void *handle)
+{
+  // Read version directly from the library since initSymbolBindings hasn't been called yet
+  int *majorVersion = (int *)hybris_dlsym(handle, "_ZN15SharedConstants12MajorVersionE");
+  int *minorVersion = (int *)hybris_dlsym(handle, "_ZN15SharedConstants12MinorVersionE");
+  
+  bool isLegacy = !majorVersion || !minorVersion || 
+                  *majorVersion < 0 || *minorVersion < 16;
+  
+  Log::trace("readAssetFileLegacy", "Version check: major=%d minor=%d isLegacy=%d",
+             majorVersion ? *majorVersion : -1,
+             minorVersion ? *minorVersion : -1,
+             isLegacy);
+  
+  if (isLegacy)
+  {
+    Log::info("readAssetFileLegacy", "Patching readAssetFile for legacy version");
+    vtr.replace("_ZN19AppPlatform_android13readAssetFileERKSs",
+                &readAssetFileLegacy);
+    vtr.replace("_ZN19AppPlatform_android12getImagePathERKSs15TextureLocation",
+                &getImagePathLegacy);
+  }
 }
 
 #ifdef JNI_DEBUG
@@ -280,23 +408,58 @@ int main(int argc, char *argv[])
   ImGui::StyleColorsLight();
 
   argparser::arg_parser p;
+  
+  // Basic options
   argparser::arg<bool> printVersion(p, "--version", "-v",
                                     "Prints version info");
+  
+  // Directory options
   argparser::arg<std::string> gameDir(p, "--game-dir", "-dg",
                                       "Directory with the game and assets");
   argparser::arg<std::string> dataDir(p, "--data-dir", "-dd",
                                       "Directory to use for the data");
   argparser::arg<std::string> cacheDir(p, "--cache-dir", "-dc",
                                        "Directory to use for cache");
+  
+  // Window options
   argparser::arg<int> windowWidth(p, "--width", "-ww", "Window width", 720);
   argparser::arg<int> windowHeight(p, "--height", "-wh", "Window height", 480);
   argparser::arg<float> pixelScale(p, "--scale", "-s", "Pixel Scale", 2.f);
+  
+  // Audio options
+  argparser::arg<bool> disableFmod(p, "--disable-fmod", "-df",
+                                   "Disables usage of the FMod audio library");
+  
+  // Performance options
+  argparser::arg<bool> disableCache(p, "--disable-cache", "-nc",
+                                    "Disable asset caching (uses more disk I/O)");
   argparser::arg<bool> mallocZero(p, "--malloc-zero", "-mz",
                                   "Patch malloc to always zero initialize "
                                   "memory, this may help workaround MCPE bugs");
-  argparser::arg<bool> disableFmod(p, "--disable-fmod", "-df",
-                                   "Disables usage of the FMod audio library");
-  if (!p.parse(argc, const_cast<const char **>(argv))) return 1;
+  
+  // Debug/Developer options
+  argparser::arg<bool> dryRun(p, "--dry-run", "-n",
+                              "Validate setup and exit without launching game");
+  argparser::arg<bool> verbose(p, "--verbose", "-V",
+                               "Enable verbose logging output");
+  argparser::arg<bool> quiet(p, "--quiet", "-q",
+                             "Suppress most log output");
+  
+  if (!p.parse(argc, const_cast<const char **>(argv))) return 0;
+  
+  // Handle verbosity settings
+  if (quiet)
+  {
+    g_logVerbosity = 0;
+    Log::setMinLevel(LogLevel::LOG_ERROR);
+  }
+  if (verbose)
+  {
+    g_logVerbosity = 2;
+    Log::setMinLevel(LogLevel::LOG_TRACE);
+  }
+  if (disableCache) g_enableAssetCache = false;
+  
   if (printVersion)
   {
     printVersionInfo();
@@ -315,9 +478,51 @@ int main(int argc, char *argv[])
     abort();
   }
 
-  Log::info("Launcher", "Version: client %s / manifest %s",
-            CLIENT_GIT_COMMIT_HASH, MANIFEST_GIT_COMMIT_HASH);
+  // Dry-run mode: validate setup and exit
+  if (dryRun)
+  {
+    std::cout << "=== Lachy-Launcher Dry Run ===\n";
+    std::cout << "Client version: " << CLIENT_GIT_COMMIT_HASH << "\n";
+    std::cout << "Manifest version: " << MANIFEST_GIT_COMMIT_HASH << "\n";
+    std::cout << "Game directory: " << PathHelper::getGameDir() << "\n";
+    std::cout << "Data directory: " << PathHelper::getPrimaryDataDirectory() << "\n";
+    std::cout << "Cache directory: " << PathHelper::getCacheDirectory() << "\n";
+    
+    // Check for required files
+    std::string libPath = PathHelper::getGameDir() + "lib/x86/libminecraftpe.so";
+    struct stat st;
+    if (stat(libPath.c_str(), &st) == 0)
+    {
+      std::cout << "Minecraft library: FOUND (" << (st.st_size / 1024 / 1024) << " MB)\n";
+    }
+    else
+    {
+      std::cout << "Minecraft library: NOT FOUND at " << libPath << "\n";
+      return 1;
+    }
+    
+    std::string assetsPath = PathHelper::getGameDir() + "assets/";
+    if (stat(assetsPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+    {
+      std::cout << "Assets directory: FOUND\n";
+    }
+    else
+    {
+      std::cout << "Assets directory: NOT FOUND at " << assetsPath << "\n";
+      return 1;
+    }
+    
+    std::cout << "\nAll checks passed. Ready to launch.\n";
+    return 0;
+  }
+
+  if (g_logVerbosity >= 1)
+  {
+    Log::info("Launcher", "Version: client %s / manifest %s",
+              CLIENT_GIT_COMMIT_HASH, MANIFEST_GIT_COMMIT_HASH);
+  }
 #ifdef __i386__
+  if (g_logVerbosity >= 1)
   {
     CpuId cpuid;
     Log::info("Launcher", "CPU: %s %s", cpuid.getManufacturer(),
@@ -329,7 +534,8 @@ int main(int argc, char *argv[])
 
   GraphicsApi graphicsApi = GraphicsApi::OPENGL_ES2;
 
-  Log::trace("Launcher", "Loading hybris libraries");
+  if (g_logVerbosity >= 2)
+    Log::trace("Launcher", "Loading hybris libraries");
   if (!disableFmod)
   {
     MinecraftUtils::loadFMod();
@@ -683,6 +889,8 @@ int main(int argc, char *argv[])
   patchDesktopUi(vtr);
 
   patchFixSettingsPath(vtr);
+
+  patchReadAssetFileLegacy(vtr, handle);
 
   auto client =
       hybris_dlsym(handle,

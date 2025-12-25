@@ -3,8 +3,12 @@
 #include <cstdio>
 #include <ctime>
 
+LogLevel Log::minLevel = LogLevel::LOG_TRACE;
+
 void Log::vlog(LogLevel level, const char* tag, const char* text, va_list args)
 {
+  if (level < minLevel) return;
+  
   char buffer[4096];
   int len = vsnprintf(buffer, sizeof(buffer), text, args);
   if (len > sizeof(buffer)) len = sizeof(buffer);

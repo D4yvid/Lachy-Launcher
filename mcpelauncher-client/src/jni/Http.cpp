@@ -129,3 +129,15 @@ extern "C" void jnivm_com_mojang_android_net_HTTPRequest_abort(
 {
   return obj->abort(env);
 }
+
+// org.apache.http.Header stubs
+extern "C" jnivm::java::lang::String* jnivm_org_apache_http_Header_getName(
+    JNIEnv* env, jnivm::org::apache::http::Header* obj, jvalue* values)
+{
+  return (jnivm::java::lang::String*)env->NewStringUTF("");
+}
+extern "C" jnivm::java::lang::String* jnivm_org_apache_http_Header_getValue(
+    JNIEnv* env, jnivm::org::apache::http::Header* obj, jvalue* values)
+{
+  return (jnivm::java::lang::String*)env->NewStringUTF("");
+}
