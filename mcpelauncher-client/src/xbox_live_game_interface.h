@@ -4,6 +4,7 @@
 #include <minecraft/Xbox.h>
 
 #include <memory>
+#include <cstdint>
 
 class XboxLiveGameInterface
 {

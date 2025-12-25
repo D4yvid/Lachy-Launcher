@@ -2,7 +2,7 @@
 
 #include <cstdarg>
 #include <cstdlib>
-#include <vector>
+#include <string>
 
 #define LogFuncDef(name, logLevel)                         \
   static void name(const char* tag, const char* text, ...) \
@@ -27,19 +27,23 @@ class Log
 {
  private:
   static LogLevel minLevel;
+  static bool initialized;
   
  public:
+  // Initialize the logging system (call once at startup)
+  static void init();
+  
   static inline const char* getLogLevelString(LogLevel lvl)
   {
-    if (lvl == LogLevel::LOG_TRACE) return "Trace";
-    if (lvl == LogLevel::LOG_DEBUG) return "Debug";
-    if (lvl == LogLevel::LOG_INFO) return "Info";
-    if (lvl == LogLevel::LOG_WARN) return "Warn";
-    if (lvl == LogLevel::LOG_ERROR) return "Error";
-    return "?";
+    if (lvl == LogLevel::LOG_TRACE) return "TRACE";
+    if (lvl == LogLevel::LOG_DEBUG) return "DEBUG";
+    if (lvl == LogLevel::LOG_INFO) return " INFO";
+    if (lvl == LogLevel::LOG_WARN) return " WARN";
+    if (lvl == LogLevel::LOG_ERROR) return "ERROR";
+    return "?????";
   }
   
-  static void setMinLevel(LogLevel level) { minLevel = level; }
+  static void setMinLevel(LogLevel level);
   static LogLevel getMinLevel() { return minLevel; }
 
   static void vlog(LogLevel level, const char* tag, const char* text,
@@ -53,9 +57,11 @@ class Log
     va_end(args);
   }
 
-  LogFuncDef(trace, LogLevel::LOG_TRACE) LogFuncDef(debug, LogLevel::LOG_DEBUG)
-      LogFuncDef(info, LogLevel::LOG_INFO) LogFuncDef(warn, LogLevel::LOG_WARN)
-          LogFuncDef(error, LogLevel::LOG_ERROR)
+  LogFuncDef(trace, LogLevel::LOG_TRACE) 
+  LogFuncDef(debug, LogLevel::LOG_DEBUG)
+  LogFuncDef(info, LogLevel::LOG_INFO) 
+  LogFuncDef(warn, LogLevel::LOG_WARN)
+  LogFuncDef(error, LogLevel::LOG_ERROR)
 };
 
 #undef LogFuncDef
