@@ -690,6 +690,34 @@ int main(int argc, char* argv[])
           });
     }
 
+    // Hook FMOD::System::createStream for streaming audio (music)
+    // Same path redirection as createSound
+    static auto orig_createStream =
+        (int (*)(void*, const char*, unsigned int, void*, void**))
+            get_hooked_symbol(
+                "_ZN4FMOD6System12createStreamEPKcjP22FMOD_"
+                "CREATESOUNDEXINFOPPNS_5SoundE");
+    if (orig_createStream)
+    {
+      hybris_hook(
+          "_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_"
+          "5SoundE",
+          (void*)+[](void* sys, const char* name, unsigned int mode,
+                     void* exinfo, void** sound) -> int
+          {
+            std::string actualPath;
+            const char* pathToUse = name;
+
+            if (name && strncmp(name, "file:///android_asset/", 22) == 0)
+            {
+              actualPath = g_assetDir + "/" + (name + 22);
+              pathToUse = actualPath.c_str();
+            }
+
+            return orig_createStream(sys, pathToUse, mode, exinfo, sound);
+          });
+    }
+
 #ifdef __arm__
     hybris_hook("_ZN4FMOD14ChannelControl9setVolumeEf",
                 (void*)&FMOD_ChannelControl_setVolume);
