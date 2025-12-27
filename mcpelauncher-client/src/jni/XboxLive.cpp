@@ -211,7 +211,7 @@ jnivm::java::lang::String*
 com::microsoft::xbox::idp::interop::Interop::getLocale(JNIEnv* env,
                                                        jclass clazz)
 {
-  return (jnivm::java::lang::String*)env->NewStringUTF("en");
+  return (jnivm::java::lang::String*)env->NewStringUTF("en_US");
 }
 
 void com::microsoft::xbox::idp::interop::Interop::RegisterWithGNS(

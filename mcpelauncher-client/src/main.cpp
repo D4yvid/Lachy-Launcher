@@ -17,6 +17,7 @@
 
 #include <functional>
 #include <iostream>
+#include <unordered_map>
 
 #include "mcpelauncher/app_platform.h"
 #include "mcpelauncher/core_mod_loader.h"
@@ -33,11 +34,13 @@ static bool isModern = false;
 #endif
 #include <build_info.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <hybris/hook.h>
 #include <jnivm.h>
 #include <minecraft/GenericMinecraft.h>
 #include <signal.h>
-#include <sys/timeb.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -45,7 +48,60 @@ static bool isModern = false;
 
 #include "JNIBinding.h"
 #include "OpenSLESPatch.h"
+#include "config.h"
+
+// Replacement for deprecated ftime() using gettimeofday()
+struct timeb
+{
+  time_t time;
+  unsigned short millitm;
+  short timezone;
+  short dstflag;
+};
+
+static int ftime_replacement(struct timeb* tb)
+{
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  tb->time = tv.tv_sec;
+  tb->millitm = tv.tv_usec / 1000;
+  tb->timezone = 0;
+  tb->dstflag = 0;
+  return 0;
+}
 #include "native_activity.h"
+
+// Log verbosity level
+static int g_logVerbosity = 1;  // 0=quiet, 1=normal, 2=verbose
+
+// Asset cache configuration
+static constexpr size_t ASSET_CACHE_MAX_ENTRIES = 64;
+static constexpr size_t ASSET_CACHE_MAX_FILE_SIZE =
+    1024 * 1024;  // 1MB per file
+
+// Simple bounded cache (no LRU tracking to avoid hybris compatibility issues)
+static std::unordered_map<std::string, std::string> g_assetCache;
+static bool g_enableAssetCache = true;
+static size_t g_assetCacheHits = 0;
+static size_t g_assetCacheMisses = 0;
+
+/**
+ * Clear oldest entries if cache exceeds max size
+ */
+static void trimAssetCache()
+{
+  if (g_assetCache.size() > ASSET_CACHE_MAX_ENTRIES)
+  {
+    // Simple strategy: clear half the cache when full
+    size_t toRemove = g_assetCache.size() / 2;
+    auto it = g_assetCache.begin();
+    while (toRemove > 0 && it != g_assetCache.end())
+    {
+      it = g_assetCache.erase(it);
+      toRemove--;
+    }
+  }
+}
 
 #define EGL_NONE 0x3038
 #define EGL_TRUE 1
@@ -53,15 +109,15 @@ static bool isModern = false;
 #define EGL_WIDTH 0x3057
 #define EGL_HEIGHT 0x3056
 using EGLint = int;
-using EGLDisplay = void *;
-using EGLSurface = void *;
-using EGLContext = void *;
-using EGLConfig = void *;
-using NativeWindowType = void *;
-using NativeDisplayType = void *;
+using EGLDisplay = void*;
+using EGLSurface = void*;
+using EGLContext = void*;
+using EGLConfig = void*;
+using NativeWindowType = void*;
+using NativeDisplayType = void*;
 
-GenericMinecraft *minecraftClient = nullptr;
-JNIEnv *jnienv = nullptr;
+GenericMinecraft* minecraftClient = nullptr;
+JNIEnv* jnienv = nullptr;
 
 void printVersionInfo();
 
@@ -119,6 +175,129 @@ void patchFixSettingsPath(PatchUtils::VtableReplaceHelper vtr)
   vtr.replace("_ZN19AppPlatform_android15getSettingsPathEv", &getSetttingsPath);
 }
 
+/**
+ * Read asset file for legacy versions (pre-0.16)
+ * The game passes a relative path, we prepend the assets directory
+ * Implements simple bounded caching for frequently accessed files
+ */
+mcpe::string readAssetFileLegacy(void* self, mcpe::string const& path)
+{
+  // Cache the assets directory to avoid repeated lookups
+  static std::string cachedAssetsDir;
+  if (cachedAssetsDir.empty())
+  {
+    cachedAssetsDir = PathHelper::getGameDir() + "assets/";
+  }
+
+  std::string pathStr = path.std();
+
+  // Check cache first
+  if (g_enableAssetCache)
+  {
+    auto it = g_assetCache.find(pathStr);
+    if (it != g_assetCache.end())
+    {
+      g_assetCacheHits++;
+      return mcpe::string(it->second.c_str(), it->second.size());
+    }
+    g_assetCacheMisses++;
+  }
+
+  std::string fullPath = cachedAssetsDir + pathStr;
+  int fd = open(fullPath.c_str(), O_RDONLY);
+  if (fd < 0)
+  {
+    if (g_logVerbosity >= 2)
+      Log::error("readAssetFileLegacy", "not found: %s", fullPath.c_str());
+    return mcpe::string();
+  }
+  struct stat sr;
+  if (fstat(fd, &sr) < 0 || (sr.st_mode & S_IFDIR))
+  {
+    close(fd);
+    return mcpe::string();
+  }
+  off_t size = sr.st_size;
+
+  std::string buffer;
+  buffer.resize((size_t)size);
+
+  ssize_t bytesRead = read(fd, &buffer[0], size);
+  if (bytesRead < 0)
+  {
+    Log::error("readAssetFileLegacy", "read error");
+    close(fd);
+    return mcpe::string();
+  }
+
+  while (bytesRead < size)
+  {
+    ssize_t res = read(fd, &buffer[0] + bytesRead, size - bytesRead);
+    if (res <= 0)
+    {
+      Log::error("readAssetFileLegacy", "read error");
+      close(fd);
+      return mcpe::string();
+    }
+    bytesRead += res;
+  }
+  close(fd);
+
+  // Cache small files with simple trimming
+  if (g_enableAssetCache &&
+      static_cast<size_t>(size) < ASSET_CACHE_MAX_FILE_SIZE)
+  {
+    trimAssetCache();
+    g_assetCache[pathStr] = buffer;
+  }
+
+  return mcpe::string(buffer.c_str(), buffer.size());
+}
+
+mcpe::string getImagePathLegacy(void* self, mcpe::string const& s, int loc)
+{
+  // Cache the assets directory
+  static std::string cachedAssetsDir;
+  if (cachedAssetsDir.empty())
+  {
+    cachedAssetsDir = PathHelper::getGameDir() + "assets/";
+  }
+
+  if (loc == 0)
+    return cachedAssetsDir + "images/" + s.std();
+  else
+    return cachedAssetsDir + s.std();
+}
+
+void patchReadAssetFileLegacy(PatchUtils::VtableReplaceHelper vtr, void* handle)
+{
+  // Read version directly from the library since initSymbolBindings hasn't been
+  // called yet
+  int* majorVersion =
+      (int*)hybris_dlsym(handle, "_ZN15SharedConstants12MajorVersionE");
+  int* minorVersion =
+      (int*)hybris_dlsym(handle, "_ZN15SharedConstants12MinorVersionE");
+  // Legacy versions are 0.x where x < 16 (i.e., 0.15.x and earlier)
+  // Version 1.x and above are NOT legacy
+  bool isLegacy = !majorVersion || !minorVersion ||
+                  (*majorVersion == 0 && *minorVersion < 16);
+
+  Log::trace("readAssetFileLegacy",
+             "Version check: major=%d minor=%d isLegacy=%d",
+             majorVersion ? *majorVersion : -1,
+             minorVersion ? *minorVersion : -1, isLegacy);
+
+  if (isLegacy)
+  {
+    Log::info("readAssetFileLegacy",
+              "Patching readAssetFile for legacy version");
+    vtr.replace("_ZN19AppPlatform_android13readAssetFileERKSs",
+                &readAssetFileLegacy);
+    vtr.replace("_ZN19AppPlatform_android12getImagePathERKSs15TextureLocation",
+                &getImagePathLegacy);
+  }
+}
+
 #ifdef JNI_DEBUG
 void dump()
 {
@@ -150,33 +329,32 @@ namespace FMOD
 }  // namespace FMOD
 
 // Translate arm softfp to armhf
-int32_t __attribute__((pcs("aapcs")))
-FMOD_ChannelControl_setVolume(FMOD::ChannelControl *ch, float f)
+int32_t __attribute__((pcs("aapcs"))) FMOD_ChannelControl_setVolume(
+    FMOD::ChannelControl* ch, float f)
 {
   return ch->setVolume(f);
 }
 
-int32_t __attribute__((pcs("aapcs")))
-FMOD_ChannelControl_setPitch(FMOD::ChannelControl *ch, float p)
+int32_t __attribute__((pcs("aapcs"))) FMOD_ChannelControl_setPitch(
+    FMOD::ChannelControl* ch, float p)
 {
   return ch->setPitch(p);
 }
 
-int32_t __attribute__((pcs("aapcs")))
-FMOD_System_set3DSettings(FMOD::System *sys, float x, float y, float z)
+int32_t __attribute__((pcs("aapcs"))) FMOD_System_set3DSettings(
+    FMOD::System* sys, float x, float y, float z)
 {
   return sys->set3DSettings(x, y, z);
 }
 
-int32_t __attribute__((pcs("aapcs")))
-FMOD_Sound_set3DMinMaxDistance(FMOD::Sound *s, float m, float M)
+int32_t __attribute__((pcs("aapcs"))) FMOD_Sound_set3DMinMaxDistance(
+    FMOD::Sound* s, float m, float M)
 {
   return s->set3DMinMaxDistance(m, M);
 }
 
-int32_t __attribute__((pcs("aapcs")))
-FMOD_ChannelControl_addFadePoint(FMOD::ChannelControl *ch, unsigned long long i,
-                                 float f)
+int32_t __attribute__((pcs("aapcs"))) FMOD_ChannelControl_addFadePoint(
+    FMOD::ChannelControl* ch, unsigned long long i, float f)
 {
   return ch->addFadePoint(i, f);
 }
@@ -184,10 +362,10 @@ FMOD_ChannelControl_addFadePoint(FMOD::ChannelControl *ch, unsigned long long i,
 
 static char initBackup[5] = {};
 static char clientInstanceBackup[5] = {};
-static void *clientInitSym = nullptr;
-static void *clientInstanceUpdate = nullptr;
+static void* clientInitSym = nullptr;
+static void* clientInstanceUpdate = nullptr;
 
-void setupInitHooks(void *handle)
+void setupInitHooks(void* handle)
 {
   assert(nullptr != handle);
 
@@ -210,10 +388,10 @@ void setupInitHooks(void *handle)
   {
     PatchUtils::patchCallInstruction(
         clientInitSym,
-        (void *)+[](void *clazz)
+        (void*)+[](void* clazz)
         {
-          const auto client = static_cast<MinecraftClient *>(clazz);
-          const auto game = static_cast<MinecraftGame *>(clazz);
+          const auto client = static_cast<MinecraftClient*>(clazz);
+          const auto game = static_cast<MinecraftGame*>(clazz);
 
           if (isModern)
             minecraftClient = new GenericMinecraft(game, nullptr);
@@ -221,7 +399,7 @@ void setupInitHooks(void *handle)
             minecraftClient = new GenericMinecraft(nullptr, client);
 
           memcpy(clientInitSym, initBackup, 5);
-          const auto init = reinterpret_cast<void (*)(void *)>(clientInitSym);
+          const auto init = reinterpret_cast<void (*)(void*)>(clientInitSym);
 
           Log::trace("Launcher", "Collecting client as %p init is: %p", clazz,
                      init);
@@ -242,12 +420,12 @@ void setupInitHooks(void *handle)
     Log::info("Launcher", "Patching CI Instance, %p", clientInstanceUpdate);
     PatchUtils::patchCallInstruction(
         clientInstanceUpdate,
-        (void *)+[](void *clazz)
+        (void*)+[](void* clazz)
         {
-          const auto instance = static_cast<ClientInstance *>(clazz);
+          const auto instance = static_cast<ClientInstance*>(clazz);
           memcpy(clientInstanceUpdate, clientInstanceBackup, 5);
           const auto update =
-              reinterpret_cast<void (*)(void *)>(clientInstanceUpdate);
+              reinterpret_cast<void (*)(void*)>(clientInstanceUpdate);
 
           Log::trace("Launcher",
                      "Collecting ClientInstance as %p and update is %p", clazz,
@@ -260,16 +438,20 @@ void setupInitHooks(void *handle)
   }
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
   static auto windowManager = GameWindowManager::getManager();
 
   CrashHandler::registerCrashHandler();
   MinecraftUtils::workaroundLocaleBug();
 
+  // Load configuration file
+  LauncherConfig config;
+  bool configLoaded = config.load();
+
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
-  ImGuiIO &io = ImGui::GetIO();
+  ImGuiIO& io = ImGui::GetIO();
   (void)io;
   io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
   io.ConfigFlags |=
@@ -280,29 +462,94 @@ int main(int argc, char *argv[])
   ImGui::StyleColorsLight();
 
   argparser::arg_parser p;
+
+  // Basic options
   argparser::arg<bool> printVersion(p, "--version", "-v",
                                     "Prints version info");
+  argparser::arg<bool> saveConfig(p, "--save-config", "-sc",
+                                  "Save current settings to config file");
+
+  // Directory options
   argparser::arg<std::string> gameDir(p, "--game-dir", "-dg",
                                       "Directory with the game and assets");
   argparser::arg<std::string> dataDir(p, "--data-dir", "-dd",
                                       "Directory to use for the data");
   argparser::arg<std::string> cacheDir(p, "--cache-dir", "-dc",
                                        "Directory to use for cache");
-  argparser::arg<int> windowWidth(p, "--width", "-ww", "Window width", 720);
-  argparser::arg<int> windowHeight(p, "--height", "-wh", "Window height", 480);
-  argparser::arg<float> pixelScale(p, "--scale", "-s", "Pixel Scale", 2.f);
+
+  // Window options - use config defaults
+  argparser::arg<int> windowWidth(p, "--width", "-ww", "Window width",
+                                  config.getWindowWidth());
+  argparser::arg<int> windowHeight(p, "--height", "-wh", "Window height",
+                                   config.getWindowHeight());
+  argparser::arg<float> pixelScale(p, "--scale", "-s", "Pixel Scale",
+                                   config.getPixelScale());
+
+  // Audio options
+  argparser::arg<bool> disableFmod(p, "--disable-fmod", "-df",
+                                   "Disables usage of the FMod audio library");
+
+  // Performance options
+  argparser::arg<bool> disableCache(
+      p, "--disable-cache", "-nc",
+      "Disable asset caching (uses more disk I/O)");
   argparser::arg<bool> mallocZero(p, "--malloc-zero", "-mz",
                                   "Patch malloc to always zero initialize "
                                   "memory, this may help workaround MCPE bugs");
-  argparser::arg<bool> disableFmod(p, "--disable-fmod", "-df",
-                                   "Disables usage of the FMod audio library");
-  if (!p.parse(argc, const_cast<const char **>(argv))) return 1;
+
+  // Debug/Developer options
+  argparser::arg<bool> dryRun(p, "--dry-run", "-n",
+                              "Validate setup and exit without launching game");
+  argparser::arg<bool> verbose(p, "--verbose", "-V",
+                               "Enable verbose logging output");
+  argparser::arg<bool> quiet(p, "--quiet", "-q", "Suppress most log output");
+
+  if (!p.parse(argc, const_cast<const char**>(argv))) return 0;
+
+  // Determine effective settings (CLI overrides config)
+  bool effectiveDisableFmod = disableFmod || config.isFmodDisabled();
+  bool effectiveDisableCache = disableCache || config.isAssetCacheDisabled();
+
+  // Handle verbosity settings
+  if (quiet)
+  {
+    g_logVerbosity = 0;
+    Log::setMinLevel(LogLevel::LOG_ERROR);
+  }
+  else if (verbose)
+  {
+    g_logVerbosity = 2;
+    Log::setMinLevel(LogLevel::LOG_TRACE);
+  }
+  else if (config.getLogLevel() == 0)
+  {
+    g_logVerbosity = 0;
+    Log::setMinLevel(LogLevel::LOG_ERROR);
+  }
+  else if (config.getLogLevel() == 2)
+  {
+    g_logVerbosity = 2;
+    Log::setMinLevel(LogLevel::LOG_TRACE);
+  }
+
+  if (effectiveDisableCache) g_enableAssetCache = false;
+
   if (printVersion)
   {
     printVersionInfo();
     return 0;
   }
-  if (!gameDir.get().empty()) PathHelper::setGameDir(gameDir);
+
+  // Use last game dir from config if not specified
+  if (gameDir.get().empty() && !config.getLastGameDir().empty())
+  {
+    PathHelper::setGameDir(config.getLastGameDir());
+  }
+  else if (!gameDir.get().empty())
+  {
+    PathHelper::setGameDir(gameDir);
+  }
+
   if (!dataDir.get().empty()) PathHelper::setDataDir(dataDir);
   if (!cacheDir.get().empty()) PathHelper::setCacheDir(cacheDir);
   if (mallocZero) MinecraftUtils::setMallocZero();
@@ -311,13 +558,89 @@ int main(int argc, char *argv[])
   {
     std::cerr << "ERROR: NO GAME DIRECTORY FOUND.\n";
     std::cerr << "PLEASE PROVIDE A GAME DIRECTORY WITH --game-dir\n";
+    if (!config.getLastGameDir().empty())
+    {
+      std::cerr << "Last used: " << config.getLastGameDir() << "\n";
+    }
     std::cerr << "Bye.\n";
     abort();
   }
 
-  Log::info("Launcher", "Version: client %s / manifest %s",
-            CLIENT_GIT_COMMIT_HASH, MANIFEST_GIT_COMMIT_HASH);
+  // Save config if requested
+  if (saveConfig)
+  {
+    config.setWindowWidth(windowWidth);
+    config.setWindowHeight(windowHeight);
+    config.setPixelScale(pixelScale);
+    config.setDisableFmod(effectiveDisableFmod);
+    config.setDisableAssetCache(effectiveDisableCache);
+    config.setLogLevel(g_logVerbosity);
+    config.setLastGameDir(PathHelper::getGameDir());
+    if (config.save())
+    {
+      std::cout << "Configuration saved to: " << config.getConfigPath() << "\n";
+    }
+    else
+    {
+      std::cerr << "Failed to save configuration\n";
+    }
+    return 0;
+  }
+
+  // Update last game dir in config
+  config.setLastGameDir(PathHelper::getGameDir());
+  config.save();
+
+  // Dry-run mode: validate setup and exit
+  if (dryRun)
+  {
+    std::cout << "=== Lachy-Launcher Dry Run ===\n";
+    std::cout << "Client version: " << CLIENT_GIT_COMMIT_HASH << "\n";
+    std::cout << "Manifest version: " << MANIFEST_GIT_COMMIT_HASH << "\n";
+    std::cout << "Game directory: " << PathHelper::getGameDir() << "\n";
+    std::cout << "Data directory: " << PathHelper::getPrimaryDataDirectory()
+              << "\n";
+    std::cout << "Cache directory: " << PathHelper::getCacheDirectory() << "\n";
+    std::cout << "Config file: " << config.getConfigPath()
+              << (configLoaded ? " (loaded)" : " (not found)") << "\n";
+
+    // Check for required files
+    std::string libPath =
+        PathHelper::getGameDir() + "lib/x86/libminecraftpe.so";
+    struct stat st;
+    if (stat(libPath.c_str(), &st) == 0)
+    {
+      std::cout << "Minecraft library: FOUND (" << (st.st_size / 1024 / 1024)
+                << " MB)\n";
+    }
+    else
+    {
+      std::cout << "Minecraft library: NOT FOUND at " << libPath << "\n";
+      return 1;
+    }
+
+    std::string assetsPath = PathHelper::getGameDir() + "assets/";
+    if (stat(assetsPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+    {
+      std::cout << "Assets directory: FOUND\n";
+    }
+    else
+    {
+      std::cout << "Assets directory: NOT FOUND at " << assetsPath << "\n";
+      return 1;
+    }
+
+    std::cout << "\nAll checks passed. Ready to launch.\n";
+    return 0;
+  }
+
+  if (g_logVerbosity >= 1)
+  {
+    Log::info("Launcher", "Version: client %s / manifest %s",
+              CLIENT_GIT_COMMIT_HASH, MANIFEST_GIT_COMMIT_HASH);
+  }
 #ifdef __i386__
+  if (g_logVerbosity >= 1)
   {
     CpuId cpuid;
     Log::info("Launcher", "CPU: %s %s", cpuid.getManufacturer(),
@@ -329,27 +652,89 @@ int main(int argc, char *argv[])
 
   GraphicsApi graphicsApi = GraphicsApi::OPENGL_ES2;
 
-  Log::trace("Launcher", "Loading hybris libraries");
-  if (!disableFmod)
+  if (g_logVerbosity >= 2) Log::trace("Launcher", "Loading hybris libraries");
+  if (!effectiveDisableFmod)
   {
+    // Store asset directory path in static for use in FMOD createSound hook
+    static std::string g_assetDir = std::string(gameDir) + "/assets";
+
     MinecraftUtils::loadFMod();
+
+    // Hook FMOD::System::createSound to redirect android_asset paths to real
+    // files Legacy Minecraft versions use file:///android_asset/ URLs which
+    // don't exist on Linux
+    static auto orig_createSound =
+        (int (*)(void*, const char*, unsigned int, void*, void**))
+            get_hooked_symbol(
+                "_ZN4FMOD6System11createSoundEPKcjP22FMOD_"
+                "CREATESOUNDEXINFOPPNS_5SoundE");
+    if (orig_createSound)
+    {
+      hybris_hook(
+          "_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_"
+          "5SoundE",
+          (void*)+[](void* sys, const char* name, unsigned int mode,
+                     void* exinfo, void** sound) -> int
+          {
+            std::string actualPath;
+            const char* pathToUse = name;
+
+            // Redirect file:///android_asset/ paths to actual assets directory
+            if (name && strncmp(name, "file:///android_asset/", 22) == 0)
+            {
+              actualPath = g_assetDir + "/" + (name + 22);
+              pathToUse = actualPath.c_str();
+            }
+
+            return orig_createSound(sys, pathToUse, mode, exinfo, sound);
+          });
+    }
+
+    // Hook FMOD::System::createStream for streaming audio (music)
+    // Same path redirection as createSound
+    static auto orig_createStream =
+        (int (*)(void*, const char*, unsigned int, void*, void**))
+            get_hooked_symbol(
+                "_ZN4FMOD6System12createStreamEPKcjP22FMOD_"
+                "CREATESOUNDEXINFOPPNS_5SoundE");
+    if (orig_createStream)
+    {
+      hybris_hook(
+          "_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_"
+          "5SoundE",
+          (void*)+[](void* sys, const char* name, unsigned int mode,
+                     void* exinfo, void** sound) -> int
+          {
+            std::string actualPath;
+            const char* pathToUse = name;
+
+            if (name && strncmp(name, "file:///android_asset/", 22) == 0)
+            {
+              actualPath = g_assetDir + "/" + (name + 22);
+              pathToUse = actualPath.c_str();
+            }
+
+            return orig_createStream(sys, pathToUse, mode, exinfo, sound);
+          });
+    }
+
 #ifdef __arm__
     hybris_hook("_ZN4FMOD14ChannelControl9setVolumeEf",
-                (void *)&FMOD_ChannelControl_setVolume);
+                (void*)&FMOD_ChannelControl_setVolume);
     hybris_hook("_ZN4FMOD14ChannelControl8setPitchEf",
-                (void *)&FMOD_ChannelControl_setPitch);
+                (void*)&FMOD_ChannelControl_setPitch);
     hybris_hook("_ZN4FMOD6System13set3DSettingsEfff",
-                (void *)&FMOD_System_set3DSettings);
+                (void*)&FMOD_System_set3DSettings);
     hybris_hook("_ZN4FMOD5Sound19set3DMinMaxDistanceEff",
-                (void *)&FMOD_Sound_set3DMinMaxDistance);
+                (void*)&FMOD_Sound_set3DMinMaxDistance);
     hybris_hook("_ZN4FMOD14ChannelControl12addFadePointEyf",
-                (void *)&FMOD_ChannelControl_addFadePoint);
+                (void*)&FMOD_ChannelControl_addFadePoint);
 #endif
   }
   else
     MinecraftUtils::stubFMod();
   // Get rid of defining OPENSSL_armcap
-  hybris_hook("OPENSSL_cpuid_setup", (void *)+[]() -> void {});
+  hybris_hook("OPENSSL_cpuid_setup", (void*)+[]() -> void {});
 
   MinecraftUtils::setupHybris();
 
@@ -362,7 +747,7 @@ int main(int argc, char *argv[])
   window->show();
   hybris_hook(
       "ANativeActivity_finish",
-      (void *)+[](ANativeActivity *activity)
+      (void*)+[](ANativeActivity* activity)
       {
         Log::warn("Launcher", "Android stub %s called",
                   "ANativeActivity_finish");
@@ -373,15 +758,15 @@ int main(int argc, char *argv[])
               // size_t outSize;
               // void * data =
               // activity->callbacks->onSaveInstanceState(activity, &outSize);
-              ((void (*)(JNIEnv *env, void *))hybris_dlsym(
+              ((void (*)(JNIEnv* env, void*))hybris_dlsym(
                   jnienv->functions->reserved3,
                   "Java_com_mojang_minecraftpe_MainActivity_"
                   "nativeUnregisterThis"))(jnienv, nullptr);
-              ((void (*)(JNIEnv *env, void *))hybris_dlsym(
+              ((void (*)(JNIEnv* env, void*))hybris_dlsym(
                   jnienv->functions->reserved3,
                   "Java_com_mojang_minecraftpe_MainActivity_nativeSuspend"))(
                   jnienv, nullptr);
-              ((void (*)(JNIEnv *env, void *))hybris_dlsym(
+              ((void (*)(JNIEnv* env, void*))hybris_dlsym(
                   jnienv->functions->reserved3,
                   "Java_com_mojang_minecraftpe_MainActivity_nativeShutdown"))(
                   jnienv, nullptr);
@@ -394,73 +779,72 @@ int main(int argc, char *argv[])
       });
   hybris_hook(
       "eglChooseConfig",
-      (void *)+[](EGLDisplay dpy, const EGLint *attrib_list, EGLConfig *configs,
-                  EGLint config_size, EGLint *num_config)
+      (void*)+[](EGLDisplay dpy, const EGLint* attrib_list, EGLConfig* configs,
+                 EGLint config_size, EGLint* num_config)
       {
         *num_config = 1;
         return EGL_TRUE;
       });
-  hybris_hook("eglGetError", (void *)(void (*)())[](){});
+  hybris_hook("eglGetError", (void*)(void (*)()) []() {});
   hybris_hook(
       "eglGetCurrentDisplay",
-      (void *)+[]() -> EGLDisplay
+      (void*)+[]() -> EGLDisplay
       {
         return (EGLDisplay)1;
       });
   hybris_hook(
       "eglCreateWindowSurface",
-      (void *)+[](EGLDisplay display, EGLConfig config,
-                  NativeWindowType native_window, EGLint const *attrib_list)
+      (void*)+[](EGLDisplay display, EGLConfig config,
+                 NativeWindowType native_window, EGLint const* attrib_list)
       {
         return native_window;
       });
   hybris_hook(
       "eglGetConfigAttrib",
-      (void *)+[](EGLDisplay display, EGLConfig config, EGLint attribute,
-                  EGLint *value)
+      (void*)+[](EGLDisplay display, EGLConfig config, EGLint attribute,
+                 EGLint* value)
       {
         return EGL_TRUE;
       });
   hybris_hook(
       "eglCreateContext",
-      (void *)+[](EGLDisplay display, EGLConfig config,
-                  EGLContext share_context, EGLint const *attrib_list)
+      (void*)+[](EGLDisplay display, EGLConfig config, EGLContext share_context,
+                 EGLint const* attrib_list)
       {
         return 1;
       });
-  hybris_hook("eglDestroySurface", (void *)(void (*)())[](){});
+  hybris_hook("eglDestroySurface", (void*)(void (*)()) []() {});
   hybris_hook(
       "eglSwapBuffers",
-      (void *)+[](EGLDisplay *display, EGLSurface surface)
+      (void*)+[](EGLDisplay* display, EGLSurface surface)
       {
         window->swapBuffers();
       });
   hybris_hook(
       "eglMakeCurrent",
-      (void *)+[](EGLDisplay display, EGLSurface draw, EGLSurface read,
-                  EGLContext context)
+      (void*)+[](EGLDisplay display, EGLSurface draw, EGLSurface read,
+                 EGLContext context)
       {
         Log::warn("Launcher", "EGL stub %s called", "eglMakeCurrent");
         return EGL_TRUE;
       });
-  hybris_hook("eglDestroyContext", (void *)(void (*)())[](){});
-  hybris_hook("eglTerminate", (void *)(void (*)())[](){});
+  hybris_hook("eglDestroyContext", (void*)(void (*)()) []() {});
+  hybris_hook("eglTerminate", (void*)(void (*)()) []() {});
   hybris_hook(
       "eglGetDisplay",
-      (void *)+[](NativeDisplayType native_display)
+      (void*)+[](NativeDisplayType native_display)
       {
         return 1;
       });
   hybris_hook(
       "eglInitialize",
-      (void *)+[](void *display, uint32_t *major, uint32_t *minor)
+      (void*)+[](void* display, uint32_t* major, uint32_t* minor)
       {
         return EGL_TRUE;
       });
   hybris_hook(
       "eglQuerySurface",
-      (void *)+[](void *dpy, EGLSurface surface, EGLint attribute,
-                  EGLint *value)
+      (void*)+[](void* dpy, EGLSurface surface, EGLint attribute, EGLint* value)
       {
         int dummy;
         switch (attribute)
@@ -478,37 +862,38 @@ int main(int argc, char *argv[])
       });
   hybris_hook(
       "eglSwapInterval",
-      (void *)+[](EGLDisplay display, EGLint interval)
+      (void*)+[](EGLDisplay display, EGLint interval)
       {
         window->swapInterval(interval);
         return EGL_TRUE;
       });
   hybris_hook(
       "eglQueryString",
-      (void *)+[](void *display, int32_t name)
+      (void*)+[](void* display, int32_t name)
       {
         return 0;
       });
   hybris_hook(
       "eglGetProcAddress",
-      (void *)+[](char *ch) -> void *
+      (void*)+[](char* ch) -> void*
       {
-        static std::map<std::string, void *> eglfuncs = {
-          { "glInvalidateFramebuffer", (void *)+[]() {} }
+        static std::map<std::string, void*> eglfuncs = {
+          { "glInvalidateFramebuffer", (void*)+[]() {} }
         };
         auto hook = eglfuncs[ch];
-        return hook ? hook
-                    : ((void *(*)(const char *))
-                           windowManager->getProcAddrFunc())(ch);
+        return hook
+                   ? hook
+                   : ((void* (*)(const char*))windowManager->getProcAddrFunc())(
+                         ch);
       });
   hybris_hook(
       "eglGetCurrentContext",
-      (void *)+[]() -> int
+      (void*)+[]() -> int
       {
         return 0;
       });
   MinecraftUtils::setupGLES2Symbols(
-      (void *(*)(const char *))windowManager->getProcAddrFunc());
+      (void* (*)(const char*))windowManager->getProcAddrFunc());
 #ifdef USE_ARMHF_SUPPORT
   ArmhfSupport::install();
 #endif
@@ -517,14 +902,14 @@ int main(int argc, char *argv[])
   {
     int fd;
     int indent;
-    void *data;
+    void* data;
     int indent2;
-    void *data2;
+    void* data2;
   };
   static Looper looper;
   hybris_hook(
       "ALooper_pollAll",
-      (void *)+[](int timeoutMillis, int *outFd, int *outEvents, void **outData)
+      (void*)+[](int timeoutMillis, int* outFd, int* outEvents, void** outData)
       {
         fd_set rfds;
         struct timeval tv;
@@ -557,8 +942,8 @@ int main(int argc, char *argv[])
       });
   hybris_hook(
       "ALooper_addFd",
-      (void *)+[](void *loopere, int fd, int ident, int events,
-                  int (*callback)(int fd, int events, void *data), void *data)
+      (void*)+[](void* loopere, int fd, int ident, int events,
+                 int (*callback)(int fd, int events, void* data), void* data)
       {
         looper.fd = fd;
         looper.indent = ident;
@@ -567,8 +952,8 @@ int main(int argc, char *argv[])
       });
   hybris_hook(
       "AInputQueue_attachLooper",
-      (void *)+[](void *queue, void *looper2, int ident, void *callback,
-                  void *data)
+      (void*)+[](void* queue, void* looper2, int ident, void* callback,
+                 void* data)
       {
         looper.indent2 = ident;
         looper.data2 = data;
@@ -576,35 +961,35 @@ int main(int argc, char *argv[])
 
   // Hook AppPlatform function directly (functions are too small for a jump
   // instruction) static vtable replace isn't working
-  auto hide = (void *)+[](void *t)
+  auto hide = (void*)+[](void* t)
   {
     window->setCursorDisabled(true);
   };
-  auto show = (void *)+[](void *t)
+  auto show = (void*)+[](void* t)
   {
     window->setCursorDisabled(false);
   };
 
-  hybris_hook("uncompress", (void *)(void (*)())[](){});
+  hybris_hook("uncompress", (void*)(void (*)()) []() {});
 
   OpenSLESPatch::install();
 
   // Hack pthread to run mainthread on the main function #macoscacoa support
   static std::atomic_bool uithread_started;
   uithread_started = false;
-  static void *(*main_routine)(void *) = nullptr;
-  static void *main_arg = nullptr;
+  static void* (*main_routine)(void*) = nullptr;
+  static void* main_arg = nullptr;
   static pthread_t mainthread = pthread_self();
-  static int (*my_pthread_create)(
-      pthread_t *thread, const pthread_attr_t *__attr,
-      void *(*start_routine)(void *), void *arg) = 0;
-  my_pthread_create = (int (*)(pthread_t *thread, const pthread_attr_t *__attr,
-                               void *(*start_routine)(void *),
-                               void *arg))get_hooked_symbol("pthread_create");
+  static int (*my_pthread_create)(pthread_t* thread,
+                                  const pthread_attr_t* __attr,
+                                  void* (*start_routine)(void*), void* arg) = 0;
+  my_pthread_create = (int (*)(pthread_t* thread, const pthread_attr_t* __attr,
+                               void* (*start_routine)(void*),
+                               void* arg))get_hooked_symbol("pthread_create");
   hybris_hook(
       "pthread_create",
-      (void *)+[](pthread_t *thread, const pthread_attr_t *__attr,
-                  void *(*start_routine)(void *), void *arg)
+      (void*)+[](pthread_t* thread, const pthread_attr_t* __attr,
+                 void* (*start_routine)(void*), void* arg)
       {
         if (uithread_started.load())
         {
@@ -621,11 +1006,11 @@ int main(int argc, char *argv[])
       });
 
   static auto my_fopen =
-      (void *(*)(const char *filename, const char *mode))get_hooked_symbol(
+      (void* (*)(const char* filename, const char* mode))get_hooked_symbol(
           "fopen");
   hybris_hook(
       "fopen",
-      (void *)+[](const char *filename, const char *mode)
+      (void*)+[](const char* filename, const char* mode)
       {
         if (!strcmp(filename,
                     "/data/data/com.mojang.minecraftpe/games/"
@@ -641,17 +1026,17 @@ int main(int argc, char *argv[])
         }
       });
   // For 0.11 or lower
-  hybris_hook("ftime", (void *)&ftime);
+  hybris_hook("ftime", (void*)&ftime_replacement);
   OpenSLESPatch::install();
 
 #ifdef __i386__
   struct sigaction act;
   sigemptyset(&act.sa_mask);
   act.sa_flags = SA_SIGINFO | SA_RESTART;
-  act.sa_sigaction = [](int, siginfo_t *si, void *ptr)
+  act.sa_sigaction = [](int, siginfo_t* si, void* ptr)
   {
-    *(char *)si->si_addr = 0x90;
-    *((char *)si->si_addr + 1) = 0x90;
+    *(char*)si->si_addr = 0x90;
+    *((char*)si->si_addr + 1) = 0x90;
     Log::warn("Minecraft BUG",
               "SIGFPE Experimental patch applied, the Game will continue now");
   };
@@ -659,7 +1044,7 @@ int main(int argc, char *argv[])
 #endif
 
   Log::trace("Launcher", "Loading Minecraft library");
-  void *handle = MinecraftUtils::loadMinecraftLib();
+  void* handle = MinecraftUtils::loadMinecraftLib();
   if (!handle)
   {
     Log::error("Launcher",
@@ -670,9 +1055,8 @@ int main(int argc, char *argv[])
   Log::debug("Launcher", "Minecraft is at offset 0x%x",
              MinecraftUtils::getLibraryBase(handle));
 
-  void **vt =
-      &((void **)hybris_dlsym(handle, "_ZTV21AppPlatform_android23"))[2];
-  void **vta = &((void **)hybris_dlsym(handle, "_ZTV19AppPlatform_android"))[2];
+  void** vt = &((void**)hybris_dlsym(handle, "_ZTV21AppPlatform_android23"))[2];
+  void** vta = &((void**)hybris_dlsym(handle, "_ZTV19AppPlatform_android"))[2];
   auto myVtableSize = PatchUtils::getVtableSize(vta);
   Log::trace("AppPlatform", "Vtable size = %u", myVtableSize);
 
@@ -684,6 +1068,8 @@ int main(int argc, char *argv[])
 
   patchFixSettingsPath(vtr);
 
+  patchReadAssetFileLegacy(vtr, handle);
+
   auto client =
       hybris_dlsym(handle,
                    "_ZN3web4http6client7details35verify_cert_chain_platform_"
@@ -692,7 +1078,7 @@ int main(int argc, char *argv[])
   {
     PatchUtils::patchCallInstruction(
         client,
-        (void *)+[]()
+        (void*)+[]()
         {
           // Log::trace("web::http::client",
           // "verify_cert_chain_platform_specific stub called");
@@ -731,17 +1117,17 @@ int main(int argc, char *argv[])
   ANativeActivityCallbacks callbacks;
   memset(&callbacks, 0, sizeof(ANativeActivityCallbacks));
   activity.callbacks = &callbacks;
-  activity.vm->GetEnv(&(void *&)activity.env, 0);
+  activity.vm->GetEnv(&(void*&)activity.env, 0);
   jnienv = activity.env;
   vm.SetReserved3(handle);
   // Avoid using cd by hand
   chdir((PathHelper::getGameDir() + "/assets").data());
   // Initialize fake java interop
   auto JNI_OnLoad =
-      (jint(*)(JavaVM * vm, void *reserved)) hybris_dlsym(handle, "JNI_OnLoad");
+      (jint (*)(JavaVM* vm, void* reserved))hybris_dlsym(handle, "JNI_OnLoad");
   if (JNI_OnLoad) JNI_OnLoad(activity.vm, 0);
   auto mainactivity = new com::mojang::minecraftpe::MainActivity(handle);
-  mainactivity->clazz = (java::lang::Class *)activity.env->FindClass(
+  mainactivity->clazz = (java::lang::Class*)activity.env->FindClass(
       "com/mojang/minecraftpe/MainActivity");  // new jnivm::Object<void> { .cl
                                                // =
                                                // activity.env->FindClass("com/mojang/minecraftpe/MainActivity"),
@@ -755,17 +1141,17 @@ int main(int argc, char *argv[])
   windowCallbacks.registerCallbacks();
   std::thread(
       [&,
-       ANativeActivity_onCreate = (ANativeActivity_createFunc *)hybris_dlsym(
+       ANativeActivity_onCreate = (ANativeActivity_createFunc*)hybris_dlsym(
            handle, "ANativeActivity_onCreate"),
-       registerthis = (void (*)(JNIEnv *env, void *))hybris_dlsym(
+       registerthis = (void (*)(JNIEnv* env, void*))hybris_dlsym(
            jnienv->functions->reserved3,
            "Java_com_mojang_minecraftpe_MainActivity_nativeRegisterThis")]()
       {
         ANativeActivity_onCreate(&activity, 0, 0);
         if (registerthis) registerthis(jnienv, activity.clazz);
-        activity.callbacks->onInputQueueCreated(&activity, (AInputQueue *)2);
-        activity.callbacks->onNativeWindowCreated(
-            &activity, (ANativeWindow *)window.get());
+        activity.callbacks->onInputQueueCreated(&activity, (AInputQueue*)2);
+        activity.callbacks->onNativeWindowCreated(&activity,
+                                                  (ANativeWindow*)window.get());
         activity.callbacks->onStart(&activity);
         // For 0.14 or lower
         activity.callbacks->onResume(&activity);
@@ -796,7 +1182,7 @@ void printVersionInfo()
   auto window =
       windowManager->createWindow("mcpelauncher", 32, 32, graphicsApi);
   auto glGetString =
-      (const char *(*)(int))windowManager->getProcAddrFunc()("glGetString");
+      (const char* (*)(int))windowManager->getProcAddrFunc()("glGetString");
   printf("GL Vendor: %s\n", glGetString(0x1F00 /* GL_VENDOR */));
   printf("GL Renderer: %s\n", glGetString(0x1F01 /* GL_RENDERER */));
   printf("GL Version: %s\n", glGetString(0x1F02 /* GL_VERSION */));

@@ -1,6 +1,9 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.13)
 
-enable_language(C CXX ASM)
+project(mcpelauncher-manifest LANGUAGES C CXX ASM)
+
+cmake_policy(SET CMP0069 NEW)
+
 set(CMAKE_THREAD_LIBS_INIT "-lpthread")
 set(CMAKE_HAVE_THREADS_LIBRARY 1)
 set(CMAKE_USE_WIN32_THREADS_INIT 0)
@@ -15,6 +18,18 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m32")
 endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -fno-delete-null-pointer-checks")
+
+# Enable optimizations in Release mode
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -DNDEBUG")
+    # Enable LTO if supported
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+    if(LTO_SUPPORTED)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+endif()
 
 string(TIMESTAMP BUILD_TIMESTAMP "%Y%m%d-%H%M%S" UTC)
 
@@ -65,6 +80,9 @@ if (APPLE)
 else()
     set(NATIVES_PATH_DIR "${CMAKE_SOURCE_DIR}/mcpelauncher-linux-bin")
 endif()
+
+# Patch libfmod to remove executable stack requirement (needed for modern kernels)
+include(cmake/patch_fmod.cmake OPTIONAL)
 
 option(ENABLE_DEV_PATHS "Enables lookup in source directories for misc files required by the launcher. This should be disabled for package builds." ON)
 if (ENABLE_DEV_PATHS)

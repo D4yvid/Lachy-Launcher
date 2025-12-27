@@ -3,6 +3,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <cstdint>
 
 #include "std/string.h"
 
